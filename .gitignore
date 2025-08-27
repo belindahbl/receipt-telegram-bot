@@ -1,0 +1,26 @@
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Environment variables file (if you create one locally)
+.env
+
+# Logs
+*.log
+
+# Database file (if using SQLite locally)
+*.db
+
+# Node modules for frontend (if you decide to add frontend development later)
+node_modules/
+
+# macOS specific files
+.DS_Store
+
+# Windows specific files
+Thumbs.db
+
+# Any other local configuration files you don't want to commit
