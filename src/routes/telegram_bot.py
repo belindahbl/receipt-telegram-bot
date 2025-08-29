@@ -177,7 +177,8 @@ def telegram_webhook():
     print("=== WEBHOOK RECEIVED ===")
     try:
         update = request.get_json()
-        print(f"Request data keys: {list(update.keys()) if update else \"No data\"}")
+        print(f"Request data keys: {list(update.keys()) if update else 'No data'}")
+
         
         if "message" in update:
             message = update["message"]
