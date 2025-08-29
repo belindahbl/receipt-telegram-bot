@@ -173,37 +173,55 @@ def download_telegram_photo(file_id):
 @telegram_bp.route('/webhook', methods=['POST'])
 def telegram_webhook():
     """Handle incoming Telegram messages."""
+    print("=== TELEGRAM WEBHOOK RECEIVED ===")
     try:
         update = request.get_json()
+        print(f"Update received: {update}")
         
         if 'message' not in update:
+            print("No message in update, returning OK")
             return jsonify({'status': 'ok'})
             
         message = update['message']
         chat_id = message['chat']['id']
+        print(f"Chat ID: {chat_id}")
         
         # Handle photo messages
         if 'photo' in message:
+            print("📸 PHOTO DETECTED - Starting processing...")
+            
             # Get the largest photo
             photo = max(message['photo'], key=lambda x: x['file_size'])
             file_id = photo['file_id']
+            print(f"Photo file_id: {file_id}")
             
             # Send processing message
-            send_telegram_message(chat_id, "📄 Processing your receipt... Please wait.")
+            print("Sending 'processing' message to user...")
+            send_result = send_telegram_message(chat_id, "📄 Processing your receipt... Please wait.")
+            print(f"Send message result: {send_result}")
             
             # Download and process the photo
+            print("🔽 DOWNLOADING PHOTO...")
             image_base64 = download_telegram_photo(file_id)
             if not image_base64:
+                print("❌ Failed to download image")
                 send_telegram_message(chat_id, "❌ Failed to download the image. Please try again.")
                 return jsonify({'status': 'ok'})
+            print("✅ Photo downloaded successfully")
             
             # Extract receipt data
+            print("🤖 CALLING OPENAI...")
             receipt_data = extract_receipt_data(image_base64)
+            print(f"OpenAI result: {receipt_data}")
+            
             if not receipt_data:
+                print("❌ Failed to extract receipt data")
                 send_telegram_message(chat_id, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt.")
                 return jsonify({'status': 'ok'})
+            print("✅ Receipt data extracted successfully")
             
             # Format confirmation message
+            print("📝 Formatting confirmation message...")
             confirmation_text = f"""📋 <b>Receipt Data Extracted:</b>
 
 📅 <b>Date:</b> {receipt_data['date']}
@@ -224,10 +242,14 @@ Please confirm if this data is correct:"""
                 ]
             }
             
-            send_telegram_message(chat_id, confirmation_text, reply_markup)
+            print("📤 Sending confirmation message with buttons...")
+            confirm_result = send_telegram_message(chat_id, confirmation_text, reply_markup)
+            print(f"Confirmation message result: {confirm_result}")
+            print("✅ PHOTO PROCESSING COMPLETE")
             
         # Handle text messages
         elif 'text' in message:
+            print(f"Text message received: {message['text']}")
             text = message['text'].lower()
             
             if text == '/start':
@@ -251,10 +273,10 @@ Just send a photo to get started! 📄"""
 5. 💾 Data will be saved to your Google Sheets
 
 <b>Tips for best results:</b>
-• Ensure good lighting
-• Keep the receipt flat
-• Make sure all text is visible and readable
-• Avoid shadows and glare
+- Ensure good lighting
+- Keep the receipt flat
+- Make sure all text is visible and readable
+- Avoid shadows and glare
 
 <b>Commands:</b>
 /start - Welcome message
@@ -264,10 +286,13 @@ Just send a photo to get started! 📄"""
             else:
                 send_telegram_message(chat_id, "📸 Please send me a photo of your receipt to process it.")
         
+        print("=== WEBHOOK PROCESSING COMPLETE ===")
         return jsonify({'status': 'ok'})
         
     except Exception as e:
-        print(f"Error in telegram_webhook: {e}")
+        print(f"❌ ERROR in telegram_webhook: {e}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
         return jsonify({'status': 'error', 'message': str(e)})
 
 @telegram_bp.route('/callback', methods=['POST'])
