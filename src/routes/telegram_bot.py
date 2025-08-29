@@ -1,3 +1,4 @@
+import sys
 import os
 import json
 import base64
@@ -173,6 +174,8 @@ def download_telegram_photo(file_id):
 @telegram_bp.route('/webhook', methods=['POST'])
 def telegram_webhook():
     """Handle incoming Telegram messages."""
+    print("WEBHOOK HIT - LOGGING TEST", flush=True)
+    sys.stdout.flush()  # Force flush
     print("=== TELEGRAM WEBHOOK RECEIVED ===")
     try:
         update = request.get_json()
@@ -247,7 +250,7 @@ Please confirm if this data is correct:"""
             print(f"Confirmation message result: {confirm_result}")
             print("✅ PHOTO PROCESSING COMPLETE")
             
-        # Handle text messages
+        # Handle text messages  
         elif 'text' in message:
             print(f"Text message received: {message['text']}")
             text = message['text'].lower()
@@ -257,12 +260,12 @@ Please confirm if this data is correct:"""
 
 📸 Send me a photo of your receipt and I'll:
 1. Extract the key information (date, company, amounts)
-2. Show you the extracted data for confirmation
+2. Show you the extracted data for confirmation  
 3. Save it to your Google Sheets automatically
 
 Just send a photo to get started! 📄"""
                 send_telegram_message(chat_id, welcome_text)
-            
+                
             elif text == '/help':
                 help_text = """📋 <b>How to use Receipt Scanner Bot:</b>
 
@@ -282,7 +285,7 @@ Just send a photo to get started! 📄"""
 /start - Welcome message
 /help - This help message"""
                 send_telegram_message(chat_id, help_text)
-            
+                
             else:
                 send_telegram_message(chat_id, "📸 Please send me a photo of your receipt to process it.")
         
@@ -293,67 +296,6 @@ Just send a photo to get started! 📄"""
         print(f"❌ ERROR in telegram_webhook: {e}")
         import traceback
         print(f"Full traceback: {traceback.format_exc()}")
-        return jsonify({'status': 'error', 'message': str(e)})
-
-@telegram_bp.route('/callback', methods=['POST'])
-def telegram_callback():
-    """Handle Telegram callback queries (button presses)."""
-    try:
-        update = request.get_json()
-        
-        if 'callback_query' not in update:
-            return jsonify({'status': 'ok'})
-            
-        callback_query = update['callback_query']
-        chat_id = callback_query['message']['chat']['id']
-        message_id = callback_query['message']['message_id']
-        data = callback_query['data']
-        
-        if data.startswith('confirm:'):
-            # Extract receipt data from callback data
-            receipt_json = data[8:]  # Remove 'confirm:' prefix
-            receipt_data = json.loads(receipt_json)
-            
-            # Save to Google Sheets
-            success = save_to_google_sheets(receipt_data)
-            
-            if success:
-                response_text = "✅ <b>Receipt saved successfully!</b>\n\nYour data has been added to the Google Sheets."
-            else:
-                response_text = "❌ <b>Failed to save receipt.</b>\n\nPlease check your Google Sheets configuration and try again."
-            
-            # Edit the original message to remove buttons
-            edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-            edit_data = {
-                'chat_id': chat_id,
-                'message_id': message_id,
-                'text': response_text,
-                'parse_mode': 'HTML'
-            }
-            requests.post(edit_url, data=edit_data)
-            
-        elif data == 'cancel':
-            response_text = "❌ <b>Receipt processing cancelled.</b>\n\nSend another photo to try again."
-            
-            # Edit the original message to remove buttons
-            edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-            edit_data = {
-                'chat_id': chat_id,
-                'message_id': message_id,
-                'text': response_text,
-                'parse_mode': 'HTML'
-            }
-            requests.post(edit_url, data=edit_data)
-        
-        # Answer the callback query
-        answer_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
-        answer_data = {'callback_query_id': callback_query['id']}
-        requests.post(answer_url, data=answer_data)
-        
-        return jsonify({'status': 'ok'})
-        
-    except Exception as e:
-        print(f"Error in telegram_callback: {e}")
         return jsonify({'status': 'error', 'message': str(e)})
 
 @telegram_bp.route('/set_webhook', methods=['POST'])

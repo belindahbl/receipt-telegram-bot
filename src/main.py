@@ -14,8 +14,15 @@ from src.routes.telegram_bot import telegram_bp
 app = Flask(__name__, static_folder=os.path.join(os.path.dirname(__file__), 'static'))
 app.config['SECRET_KEY'] = 'asdf#FGSgvasgf$5$WGT'
 
-# Configure logging
-app.logger.setLevel(logging.INFO)
+# Configure logging to show everything
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+
+# Set Flask logger
+app.logger.setLevel(logging.DEBUG)
 app.logger.addHandler(logging.StreamHandler(sys.stdout))
 
 # Enable CORS for all routes
@@ -24,19 +31,12 @@ CORS(app)
 app.register_blueprint(user_bp, url_prefix='/api')
 app.register_blueprint(telegram_bp, url_prefix='/telegram')
 
-# uncomment if you need to use database
-#app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(os.path.dirname(__file__), 'database', 'app.db')}"
-#app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-#db.init_app(app)
-#with app.app_context():
- #   db.create_all()
-
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
     static_folder_path = app.static_folder
     if static_folder_path is None:
-            return "Static folder not configured", 404
+        return "Static folder not configured", 404
 
     if path != "" and os.path.exists(os.path.join(static_folder_path, path)):
         return send_from_directory(static_folder_path, path)
@@ -47,6 +47,6 @@ def serve(path):
         else:
             return "index.html not found", 404
 
-
 if __name__ == '__main__':
+    print("STARTING FLASK APP WITH DEBUG LOGGING")
     app.run(host='0.0.0.0', port=5000, debug=True)
