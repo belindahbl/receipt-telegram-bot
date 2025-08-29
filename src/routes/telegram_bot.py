@@ -179,74 +179,75 @@ def telegram_webhook():
         update = request.get_json()
         print(f"Request data keys: {list(update.keys()) if update else \"No data\"}")
         
-        if "message" not in update:
-            print("No message in update, returning ok.")
-            return jsonify({"status": "ok"})
+        if "message" in update:
+            message = update["message"]
+            print(f"Message type: {list(message.keys())}")
+            chat_id = message["chat"]["id"]
             
-        message = update["message"]
-        print(f"Message type: {list(message.keys())}")
-        chat_id = message["chat"]["id"]
-        
-        # Handle photo messages
-        if "photo" in message:
-            print("📸 PHOTO DETECTED - Starting processing...")
-            # Get the largest photo
-            photo = max(message["photo"], key=lambda x: x["file_size"])
-            file_id = photo["file_id"]
-            
-            # Send processing message
-            print("Sending \"processing\" message to user...")
-            send_telegram_message(chat_id, "📄 Processing your receipt... Please wait.")
-            
-            print("🤖 CALLING OPENAI...")
-            # Download and process the photo
-            image_base64 = download_telegram_photo(file_id)
-            if not image_base64:
-                print("❌ Failed to download the image.")
-                send_telegram_message(chat_id, "❌ Failed to download the image. Please try again.")
-                return jsonify({"status": "ok"})
-            
-            # Extract receipt data
-            receipt_data = extract_receipt_data(image_base64)
-            print(f"OpenAI result: {receipt_data}")
-            if not receipt_data:
-                print("❌ Failed to extract receipt data.")
-                send_telegram_message(chat_id, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt.")
-                return jsonify({"status": "ok"})
-            
-            print("📊 WRITING TO GOOGLE SHEETS...")
-            # Format confirmation message
-            confirmation_text = f"""📋 <b>Receipt Data Extracted:</b>\n\n📅 <b>Date:</b> {receipt_data["date"]}\n🏪 <b>Company:</b> {receipt_data["company"]}\n💰 <b>Total (incl GST):</b> ${receipt_data["total_incl_gst"]}\n📊 <b>GST (9%):</b> ${receipt_data["gst_amount"]}\n💵 <b>Amount (excl GST):</b> ${receipt_data["total_excl_gst"]}\n\nPlease confirm if this data is correct:"""
-            
-            # Create inline keyboard for confirmation
-            reply_markup = {
-                "inline_keyboard": [
-                    [
-                        {"text": "✅ Confirm & Save", "callback_data": f"confirm:{json.dumps(receipt_data)}"},
-                        {"text": "❌ Cancel", "callback_data": "cancel"}
+            # Handle photo messages
+            if "photo" in message:
+                print("📸 PHOTO DETECTED - Starting processing...")
+                # Get the largest photo
+                photo = max(message["photo"], key=lambda x: x["file_size"])
+                file_id = photo["file_id"]
+                
+                # Send processing message
+                print("Sending \"processing\" message to user...")
+                send_telegram_message(chat_id, "📄 Processing your receipt... Please wait.")
+                
+                print("🤖 CALLING OPENAI...")
+                # Download and process the photo
+                image_base64 = download_telegram_photo(file_id)
+                if not image_base64:
+                    print("❌ Failed to download the image.")
+                    send_telegram_message(chat_id, "❌ Failed to download the image. Please try again.")
+                    return jsonify({"status": "ok"})
+                
+                # Extract receipt data
+                receipt_data = extract_receipt_data(image_base64)
+                print(f"OpenAI result: {receipt_data}")
+                if not receipt_data:
+                    print("❌ Failed to extract receipt data.")
+                    send_telegram_message(chat_id, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt.")
+                    return jsonify({"status": "ok"})
+                
+                print("📊 WRITING TO GOOGLE SHEETS...")
+                # Format confirmation message
+                confirmation_text = f"""📋 <b>Receipt Data Extracted:</b>\n\n📅 <b>Date:</b> {receipt_data["date"]}\n🏪 <b>Company:</b> {receipt_data["company"]}\n💰 <b>Total (incl GST):</b> ${receipt_data["total_incl_gst"]}\n📊 <b>GST (9%):</b> ${receipt_data["gst_amount"]}\n💵 <b>Amount (excl GST):</b> ${receipt_data["total_excl_gst"]}\n\nPlease confirm if this data is correct:"""
+                
+                # Create inline keyboard for confirmation
+                reply_markup = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "✅ Confirm & Save", "callback_data": f"confirm:{json.dumps(receipt_data)}"},
+                            {"text": "❌ Cancel", "callback_data": "cancel"}
+                        ]
                     ]
-                ]
-            }
-            
-            send_telegram_message(chat_id, confirmation_text, reply_markup)
-            print("✅ PROCESS COMPLETE - Notifying user...")
-            
-        # Handle text messages
-        elif "text" in message:
-            text = message["text"].lower()
-            print(f"Text message received: {text}")
-            
-            if text == "/start":
-                welcome_text = """🤖 <b>Welcome to Receipt Scanner Bot!</b>\n\n📸 Send me a photo of your receipt and I\"ll:\n1. Extract the key information (date, company, amounts)\n2. Show you the extracted data for confirmation\n3. Save it to your Google Sheets automatically\n\nJust send a photo to get started! 📄"""
-                send_telegram_message(chat_id, welcome_text)
-            
-            elif text == "/help":
-                help_text = """📋 <b>How to use Receipt Scanner Bot:</b>\n\n1. 📸 Take a clear photo of your receipt\n2. 📤 Send the photo to this bot\n3. ⏳ Wait for data extraction (usually takes a few seconds)\n4. ✅ Review and confirm the extracted data\n5. 💾 Data will be saved to your Google Sheets\n\n<b>Tips for best results:</b>\n• Ensure good lighting\n• Keep the receipt flat\n• Make sure all text is visible and readable\n• Avoid shadows and glare\n\n<b>Commands:</b>\n/start - Welcome message\n/help - This help message"""
-                send_telegram_message(chat_id, help_text)
-            
-            else:
-                send_telegram_message(chat_id, "📸 Please send me a photo of your receipt to process it.")
+                }
+                
+                send_telegram_message(chat_id, confirmation_text, reply_markup)
+                print("✅ PROCESS COMPLETE - Notifying user...")
+                
+            # Handle text messages
+            elif "text" in message:
+                text = message["text"].lower()
+                print(f"Text message received: {text}")
+                
+                if text == "/start":
+                    welcome_text = """🤖 <b>Welcome to Receipt Scanner Bot!</b>\n\n📸 Send me a photo of your receipt and I\"ll:\n1. Extract the key information (date, company, amounts)\n2. Show you the extracted data for confirmation\n3. Save it to your Google Sheets automatically\n\nJust send a photo to get started! 📄"""
+                    send_telegram_message(chat_id, welcome_text)
+                
+                elif text == "/help":
+                    help_text = """📋 <b>How to use Receipt Scanner Bot:</b>\n\n1. 📸 Take a clear photo of your receipt\n2. 📤 Send the photo to this bot\n3. ⏳ Wait for data extraction (usually takes a few seconds)\n4. ✅ Review and confirm the extracted data\n5. 💾 Data will be saved to your Google Sheets\n\n<b>Tips for best results:</b>\n• Ensure good lighting\n• Keep the receipt flat\n• Make sure all text is visible and readable\n• Avoid shadows and glare\n\n<b>Commands:</b>\n/start - Welcome message\n/help - This help message"""
+                    send_telegram_message(chat_id, help_text)
+                
+                else:
+                    send_telegram_message(chat_id, "📸 Please send me a photo of your receipt to process it.")
         
+        elif "callback_query" in update:
+            print("➡️ CALLBACK QUERY DETECTED - Routing to telegram_callback...")
+            return telegram_callback()
+
         print("=== WEBHOOK COMPLETE ===")
         return jsonify({"status": "ok"})
         
