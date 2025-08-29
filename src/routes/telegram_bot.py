@@ -9,6 +9,8 @@ from google.oauth2 import service_account
 from datetime import datetime
 import re
 import threading
+import html
+import hashlib
 
 telegram_bp = Blueprint("telegram", __name__)
 
@@ -20,6 +22,9 @@ GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
 
 # Initialize OpenAI client
 openai.api_key = OPENAI_API_KEY
+
+# Store receipt data temporarily (in production, use Redis or database)
+temp_receipt_storage = {}
 
 def get_google_sheets_service():
     """Initialize Google Sheets service with credentials."""
@@ -128,19 +133,41 @@ def save_to_google_sheets(receipt_data):
         return False
 
 def send_telegram_message(chat_id, text, reply_markup=None):
-    """Send a message to Telegram chat."""
+    """Send a message to Telegram chat with proper error handling."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        
+        # Ensure text is not empty and not too long
+        if not text or text.strip() == "":
+            text = "Empty message"
+        
+        # Telegram message limit is 4096 characters
+        if len(text) > 4000:
+            text = text[:4000] + "... (truncated)"
+        
         data = {
-            "chat_id": chat_id,
+            "chat_id": str(chat_id),  # Ensure chat_id is string
             "text": text,
             "parse_mode": "HTML"
         }
+        
         if reply_markup:
             data["reply_markup"] = json.dumps(reply_markup)
             
-        response = requests.post(url, data=data)
-        return response.json()
+        print(f"Sending message to chat_id {chat_id}: {text[:100]}...")
+        response = requests.post(url, data=data, timeout=10)
+        
+        if response.status_code != 200:
+            print(f"Telegram API error: {response.status_code} - {response.text}")
+            return None
+        
+        result = response.json()
+        if not result.get("ok"):
+            print(f"Telegram API returned error: {result}")
+            return None
+            
+        return result
+        
     except Exception as e:
         print(f"Error sending Telegram message: {e}")
         return None
@@ -150,7 +177,7 @@ def download_telegram_photo(file_id):
     try:
         # Get file path
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
-        response = requests.get(url, params={"file_id": file_id})
+        response = requests.get(url, params={"file_id": file_id}, timeout=10)
         file_info = response.json()
         print(f"Telegram getFile response: {file_info}")
         
@@ -161,7 +188,7 @@ def download_telegram_photo(file_id):
         
         # Download the file
         download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-        file_response = requests.get(download_url)
+        file_response = requests.get(download_url, timeout=30)
         
         if file_response.status_code == 200:
             return base64.b64encode(file_response.content).decode("utf-8")
@@ -173,34 +200,68 @@ def download_telegram_photo(file_id):
         return None
 
 def process_receipt_in_background(chat_id, file_id):
-    print("Background processing started...")
-    image_base64 = download_telegram_photo(file_id)
-    if not image_base64:
-        print("❌ Failed to download the image in background.")
-        send_telegram_message(chat_id, "❌ Failed to download the image. Please try again.")
-        return
-    
-    receipt_data = extract_receipt_data(image_base64)
-    print(f"OpenAI result in background: {receipt_data}")
-    if not receipt_data:
-        print("❌ Failed to extract receipt data in background.")
-        send_telegram_message(chat_id, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt.")
-        return
-    
-    print("📊 WRITING TO GOOGLE SHEETS in background...")
-    confirmation_text = f"""📋 <b>Receipt Data Extracted:</b>\n\n📅 <b>Date:</b> {receipt_data["date"]}\n🏪 <b>Company:</b> {receipt_data["company"]}\n💰 <b>Total (incl GST):</b> ${receipt_data["total_incl_gst"]}\n📊 <b>GST (9%):</b> ${receipt_data["gst_amount"]}\n💵 <b>Amount (excl GST):</b> ${receipt_data["total_excl_gst"]}\n\nPlease confirm if this data is correct:"""
-    
-    reply_markup = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Confirm & Save", "callback_data": f"confirm:{json.dumps(receipt_data)}"},
-                {"text": "❌ Cancel", "callback_data": "cancel"}
+    """Process receipt in background thread."""
+    try:
+        print("Background processing started...")
+        
+        # Download image
+        image_base64 = download_telegram_photo(file_id)
+        if not image_base64:
+            print("❌ Failed to download the image in background.")
+            send_telegram_message(chat_id, "❌ Failed to download the image. Please try again.")
+            return
+        
+        # Extract receipt data
+        receipt_data = extract_receipt_data(image_base64)
+        print(f"OpenAI result in background: {receipt_data}")
+        if not receipt_data:
+            print("❌ Failed to extract receipt data in background.")
+            send_telegram_message(chat_id, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt.")
+            return
+        
+        print("📊 Preparing confirmation message...")
+        
+        # Store receipt data with a hash key (instead of embedding in callback)
+        receipt_hash = hashlib.md5(json.dumps(receipt_data, sort_keys=True).encode()).hexdigest()[:8]
+        temp_receipt_storage[receipt_hash] = receipt_data
+        
+        # Clean up the text - escape HTML entities and fix formatting
+        company_name = html.escape(str(receipt_data.get("company", "Unknown")))
+        date_str = html.escape(str(receipt_data.get("date", "Unknown")))
+        total_incl = html.escape(str(receipt_data.get("total_incl_gst", "0.00")))
+        gst_amount = html.escape(str(receipt_data.get("gst_amount", "0.00")))
+        total_excl = html.escape(str(receipt_data.get("total_excl_gst", "0.00")))
+        
+        confirmation_text = f"""📋 <b>Receipt Data Extracted:</b>
+
+📅 <b>Date:</b> {date_str}
+🏪 <b>Company:</b> {company_name}
+💰 <b>Total (incl GST):</b> ${total_incl}
+📊 <b>GST (9%):</b> ${gst_amount}
+💵 <b>Amount (excl GST):</b> ${total_excl}
+
+Please confirm if this data is correct:"""
+        
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Confirm & Save", "callback_data": f"confirm:{receipt_hash}"},
+                    {"text": "❌ Cancel", "callback_data": "cancel"}
+                ]
             ]
-        ]
-    }
-    
-    send_telegram_message(chat_id, confirmation_text, reply_markup)
-    print("✅ PROCESS COMPLETE in background - Notifying user...")
+        }
+        
+        result = send_telegram_message(chat_id, confirmation_text, reply_markup)
+        if result:
+            print("✅ PROCESS COMPLETE in background - User notified successfully")
+        else:
+            print("❌ Failed to send confirmation message")
+            
+    except Exception as e:
+        print(f"❌ ERROR in background processing: {str(e)}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
+        send_telegram_message(chat_id, "❌ An error occurred while processing your receipt. Please try again.")
 
 @telegram_bp.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -222,10 +283,15 @@ def telegram_webhook():
                 file_id = photo["file_id"]
                 
                 print("Sending \"processing\" message to user...")
-                send_telegram_message(chat_id, "📄 Processing your receipt... Please wait.")
+                result = send_telegram_message(chat_id, "📄 Processing your receipt... Please wait.")
+                
+                if not result:
+                    print("❌ Failed to send processing message")
+                    return jsonify({"status": "error"})
                 
                 # Start background processing
                 thread = threading.Thread(target=process_receipt_in_background, args=(chat_id, file_id))
+                thread.daemon = True
                 thread.start()
                 
                 print("Webhook returning OK, background processing initiated.")
@@ -237,19 +303,42 @@ def telegram_webhook():
                 print(f"Text message received: {text}")
                 
                 if text == "/start":
-                    welcome_text = """🤖 <b>Welcome to Receipt Scanner Bot!</b>\n\n📸 Send me a photo of your receipt and I\"ll:\n1. Extract the key information (date, company, amounts)\n2. Show you the extracted data for confirmation\n3. Save it to your Google Sheets automatically\n\nJust send a photo to get started! 📄"""
+                    welcome_text = """🤖 <b>Welcome to Receipt Scanner Bot!</b>
+
+📸 Send me a photo of your receipt and I'll:
+1. Extract the key information (date, company, amounts)
+2. Show you the extracted data for confirmation
+3. Save it to your Google Sheets automatically
+
+Just send a photo to get started! 📄"""
                     send_telegram_message(chat_id, welcome_text)
                 
                 elif text == "/help":
-                    help_text = """📋 <b>How to use Receipt Scanner Bot:</b>\n\n1. 📸 Take a clear photo of your receipt\n2. 📤 Send the photo to this bot\n3. ⏳ Wait for data extraction (usually takes a few seconds)\n4. ✅ Review and confirm the extracted data\n5. 💾 Data will be saved to your Google Sheets\n\n<b>Tips for best results:</b>\n• Ensure good lighting\n• Keep the receipt flat\n• Make sure all text is visible and readable\n• Avoid shadows and glare\n\n<b>Commands:</b>\n/start - Welcome message\n/help - This help message"""
+                    help_text = """📋 <b>How to use Receipt Scanner Bot:</b>
+
+1. 📸 Take a clear photo of your receipt
+2. 📤 Send the photo to this bot
+3. ⏳ Wait for data extraction (usually takes a few seconds)
+4. ✅ Review and confirm the extracted data
+5. 💾 Data will be saved to your Google Sheets
+
+<b>Tips for best results:</b>
+• Ensure good lighting
+• Keep the receipt flat
+• Make sure all text is visible and readable
+• Avoid shadows and glare
+
+<b>Commands:</b>
+/start - Welcome message
+/help - This help message"""
                     send_telegram_message(chat_id, help_text)
                 
                 else:
                     send_telegram_message(chat_id, "📸 Please send me a photo of your receipt to process it.")
         
         elif "callback_query" in update:
-            print("Callback query detected, routing to telegram_callback.")
-            return telegram_callback()
+            print("Callback query detected, processing...")
+            return handle_callback_query(update)
 
         print("=== WEBHOOK COMPLETE ===")
         return jsonify({"status": "ok"})
@@ -260,66 +349,65 @@ def telegram_webhook():
         print(f"Full traceback: {traceback.format_exc()}")
         return jsonify({"status": "error", "message": str(e)})
 
-@telegram_bp.route("/callback", methods=["POST"])
-def telegram_callback():
+def handle_callback_query(update):
     """Handle Telegram callback queries (button presses)."""
     try:
-        update = request.get_json()
-        
-        if "callback_query" not in update:
-            return jsonify({"status": "ok"})
-            
         callback_query = update["callback_query"]
         chat_id = callback_query["message"]["chat"]["id"]
         message_id = callback_query["message"]["message_id"]
         data = callback_query["data"]
         
         if data.startswith("confirm:"):
-            # Extract receipt data from callback data
-            receipt_json = data[8:]  # Remove "confirm:" prefix
-            receipt_data = json.loads(receipt_json)
+            # Extract receipt hash from callback data
+            receipt_hash = data[8:]  # Remove "confirm:" prefix
+            receipt_data = temp_receipt_storage.get(receipt_hash)
             
-            # Save to Google Sheets
-            success = save_to_google_sheets(receipt_data)
-            
-            if success:
-                response_text = "✅ <b>Receipt saved successfully!</b>\n\nYour data has been added to the Google Sheets."
+            if not receipt_data:
+                response_text = "❌ <b>Error:</b> Receipt data expired. Please try again."
             else:
-                response_text = "❌ <b>Failed to save receipt.</b>\n\nPlease check your Google Sheets configuration and try again."
-            
-            # Edit the original message to remove buttons
-            edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-            edit_data = {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": response_text,
-                "parse_mode": "HTML"
-            }
-            requests.post(edit_url, data=edit_data)
+                # Save to Google Sheets
+                success = save_to_google_sheets(receipt_data)
+                
+                if success:
+                    response_text = "✅ <b>Receipt saved successfully!</b>\n\nYour data has been added to the Google Sheets."
+                    # Clean up temporary storage
+                    temp_receipt_storage.pop(receipt_hash, None)
+                else:
+                    response_text = "❌ <b>Failed to save receipt.</b>\n\nPlease check your Google Sheets configuration and try again."
             
         elif data == "cancel":
             response_text = "❌ <b>Receipt processing cancelled.</b>\n\nSend another photo to try again."
-            
-            # Edit the original message to remove buttons
-            edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-            edit_data = {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": response_text,
-                "parse_mode": "HTML"
-            }
-            requests.post(edit_url, data=edit_data)
+        else:
+            response_text = "❌ Unknown action."
+        
+        # Edit the original message to remove buttons
+        edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+        edit_data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": response_text,
+            "parse_mode": "HTML"
+        }
+        edit_response = requests.post(edit_url, data=edit_data, timeout=10)
+        
+        if edit_response.status_code != 200:
+            print(f"Failed to edit message: {edit_response.text}")
         
         # Answer the callback query
         answer_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
         answer_data = {"callback_query_id": callback_query["id"]}
-        requests.post(answer_url, data=answer_data)
+        requests.post(answer_url, data=answer_data, timeout=10)
         
         return jsonify({"status": "ok"})
         
     except Exception as e:
-        print(f"Error in telegram_callback: {e}")
+        print(f"Error in handle_callback_query: {e}")
         return jsonify({"status": "error", "message": str(e)})
+
+@telegram_bp.route("/callback", methods=["POST"])
+def telegram_callback():
+    """Handle Telegram callback queries (button presses) - legacy endpoint."""
+    return handle_callback_query(request.get_json())
 
 @telegram_bp.route("/set_webhook", methods=["POST"])
 def set_webhook():
@@ -332,7 +420,7 @@ def set_webhook():
             return jsonify({"error": "webhook_url is required"}), 400
         
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-        response = requests.post(url, data={"url": webhook_url})
+        response = requests.post(url, data={"url": webhook_url}, timeout=10)
         
         return jsonify(response.json())
         
@@ -344,7 +432,7 @@ def webhook_info():
     """Get current webhook information."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         return jsonify(response.json())
         
     except Exception as e:
