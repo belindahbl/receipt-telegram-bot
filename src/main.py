@@ -1,5 +1,7 @@
 import os
 import sys
+import logging
+
 # DON'T CHANGE THIS !!!
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -11,6 +13,10 @@ from src.routes.telegram_bot import telegram_bp
 
 app = Flask(__name__, static_folder=os.path.join(os.path.dirname(__file__), 'static'))
 app.config['SECRET_KEY'] = 'asdf#FGSgvasgf$5$WGT'
+
+# Configure logging
+app.logger.setLevel(logging.INFO)
+app.logger.addHandler(logging.StreamHandler(sys.stdout))
 
 # Enable CORS for all routes
 CORS(app)
