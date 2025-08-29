@@ -8,6 +8,7 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from datetime import datetime
 import re
+import threading
 
 telegram_bp = Blueprint("telegram", __name__)
 
@@ -151,7 +152,7 @@ def download_telegram_photo(file_id):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
         response = requests.get(url, params={"file_id": file_id})
         file_info = response.json()
-        print(f"Telegram getFile response: {file_info}") # Added logging
+        print(f"Telegram getFile response: {file_info}")
         
         if not file_info.get("ok"):
             return None
@@ -171,6 +172,36 @@ def download_telegram_photo(file_id):
         print(f"Error downloading Telegram photo: {e}")
         return None
 
+def process_receipt_in_background(chat_id, file_id):
+    print("Background processing started...")
+    image_base64 = download_telegram_photo(file_id)
+    if not image_base64:
+        print("❌ Failed to download the image in background.")
+        send_telegram_message(chat_id, "❌ Failed to download the image. Please try again.")
+        return
+    
+    receipt_data = extract_receipt_data(image_base64)
+    print(f"OpenAI result in background: {receipt_data}")
+    if not receipt_data:
+        print("❌ Failed to extract receipt data in background.")
+        send_telegram_message(chat_id, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt.")
+        return
+    
+    print("📊 WRITING TO GOOGLE SHEETS in background...")
+    confirmation_text = f"""📋 <b>Receipt Data Extracted:</b>\n\n📅 <b>Date:</b> {receipt_data["date"]}\n🏪 <b>Company:</b> {receipt_data["company"]}\n💰 <b>Total (incl GST):</b> ${receipt_data["total_incl_gst"]}\n📊 <b>GST (9%):</b> ${receipt_data["gst_amount"]}\n💵 <b>Amount (excl GST):</b> ${receipt_data["total_excl_gst"]}\n\nPlease confirm if this data is correct:"""
+    
+    reply_markup = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Confirm & Save", "callback_data": f"confirm:{json.dumps(receipt_data)}"},
+                {"text": "❌ Cancel", "callback_data": "cancel"}
+            ]
+        ]
+    }
+    
+    send_telegram_message(chat_id, confirmation_text, reply_markup)
+    print("✅ PROCESS COMPLETE in background - Notifying user...")
+
 @telegram_bp.route("/webhook", methods=["POST"])
 def telegram_webhook():
     """Handle incoming Telegram messages."""
@@ -178,7 +209,6 @@ def telegram_webhook():
     try:
         update = request.get_json()
         print(f"Request data keys: {list(update.keys()) if update else 'No data'}")
-
         
         if "message" in update:
             message = update["message"]
@@ -188,46 +218,18 @@ def telegram_webhook():
             # Handle photo messages
             if "photo" in message:
                 print("📸 PHOTO DETECTED - Starting processing...")
-                # Get the largest photo
                 photo = max(message["photo"], key=lambda x: x["file_size"])
                 file_id = photo["file_id"]
                 
-                # Send processing message
                 print("Sending \"processing\" message to user...")
                 send_telegram_message(chat_id, "📄 Processing your receipt... Please wait.")
                 
-                print("🤖 CALLING OPENAI...")
-                # Download and process the photo
-                image_base64 = download_telegram_photo(file_id)
-                if not image_base64:
-                    print("❌ Failed to download the image.")
-                    send_telegram_message(chat_id, "❌ Failed to download the image. Please try again.")
-                    return jsonify({"status": "ok"})
+                # Start background processing
+                thread = threading.Thread(target=process_receipt_in_background, args=(chat_id, file_id))
+                thread.start()
                 
-                # Extract receipt data
-                receipt_data = extract_receipt_data(image_base64)
-                print(f"OpenAI result: {receipt_data}")
-                if not receipt_data:
-                    print("❌ Failed to extract receipt data.")
-                    send_telegram_message(chat_id, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt.")
-                    return jsonify({"status": "ok"})
-                
-                print("📊 WRITING TO GOOGLE SHEETS...")
-                # Format confirmation message
-                confirmation_text = f"""📋 <b>Receipt Data Extracted:</b>\n\n📅 <b>Date:</b> {receipt_data["date"]}\n🏪 <b>Company:</b> {receipt_data["company"]}\n💰 <b>Total (incl GST):</b> ${receipt_data["total_incl_gst"]}\n📊 <b>GST (9%):</b> ${receipt_data["gst_amount"]}\n💵 <b>Amount (excl GST):</b> ${receipt_data["total_excl_gst"]}\n\nPlease confirm if this data is correct:"""
-                
-                # Create inline keyboard for confirmation
-                reply_markup = {
-                    "inline_keyboard": [
-                        [
-                            {"text": "✅ Confirm & Save", "callback_data": f"confirm:{json.dumps(receipt_data)}"},
-                            {"text": "❌ Cancel", "callback_data": "cancel"}
-                        ]
-                    ]
-                }
-                
-                send_telegram_message(chat_id, confirmation_text, reply_markup)
-                print("✅ PROCESS COMPLETE - Notifying user...")
+                print("Webhook returning OK, background processing initiated.")
+                return jsonify({"status": "ok"})
                 
             # Handle text messages
             elif "text" in message:
@@ -246,7 +248,7 @@ def telegram_webhook():
                     send_telegram_message(chat_id, "📸 Please send me a photo of your receipt to process it.")
         
         elif "callback_query" in update:
-            print("➡️ CALLBACK QUERY DETECTED - Routing to telegram_callback...")
+            print("Callback query detected, routing to telegram_callback.")
             return telegram_callback()
 
         print("=== WEBHOOK COMPLETE ===")
