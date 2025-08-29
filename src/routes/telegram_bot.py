@@ -29,15 +29,52 @@ temp_receipt_storage = {}
 def get_google_sheets_service():
     """Initialize Google Sheets service with credentials."""
     try:
-        credentials_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+        # Debug: Check if credentials exist
+        if not GOOGLE_SHEETS_CREDENTIALS_JSON:
+            print("❌ GOOGLE_SHEETS_CREDENTIALS_JSON environment variable is not set")
+            return None
+        
+        print(f"📋 Credentials JSON length: {len(GOOGLE_SHEETS_CREDENTIALS_JSON)}")
+        print(f"📋 First 100 chars: {GOOGLE_SHEETS_CREDENTIALS_JSON[:100]}...")
+        
+        # Try to parse the JSON
+        try:
+            credentials_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+        except json.JSONDecodeError as e:
+            print(f"❌ Failed to parse credentials JSON: {e}")
+            print("💡 Make sure your JSON is properly escaped and formatted")
+            return None
+        
+        # Check if required keys exist
+        required_keys = ['type', 'project_id', 'private_key_id', 'private_key', 'client_email']
+        missing_keys = [key for key in required_keys if key not in credentials_dict]
+        if missing_keys:
+            print(f"❌ Missing required keys in credentials: {missing_keys}")
+            return None
+        
+        print("✅ Credentials JSON parsed successfully")
+        print(f"📧 Client email: {credentials_dict.get('client_email', 'Not found')}")
+        
+        # Fix common private key formatting issues
+        if 'private_key' in credentials_dict:
+            # Ensure private key has proper line breaks
+            private_key = credentials_dict['private_key']
+            if '\\n' in private_key:
+                credentials_dict['private_key'] = private_key.replace('\\n', '\n')
+                print("🔧 Fixed private key line breaks")
+        
         credentials = service_account.Credentials.from_service_account_info(
             credentials_dict,
             scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
         service = build("sheets", "v4", credentials=credentials)
+        print("✅ Google Sheets service initialized successfully")
         return service
+        
     except Exception as e:
-        print(f"Error initializing Google Sheets service: {e}")
+        print(f"❌ Error initializing Google Sheets service: {e}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
         return None
 
 def extract_receipt_data(image_base64):
@@ -101,10 +138,21 @@ def extract_receipt_data(image_base64):
 def save_to_google_sheets(receipt_data):
     """Save receipt data to Google Sheets."""
     try:
+        print("🔄 Attempting to initialize Google Sheets service...")
         service = get_google_sheets_service()
         if not service:
+            print("❌ Failed to initialize Google Sheets service")
             return False
-            
+        
+        print("✅ Google Sheets service ready, preparing data...")
+        
+        # Debug: Check sheet ID
+        if not GOOGLE_SHEETS_ID:
+            print("❌ GOOGLE_SHEETS_ID environment variable is not set")
+            return False
+        
+        print(f"📊 Using Google Sheets ID: {GOOGLE_SHEETS_ID}")
+        
         # Prepare the row data
         row_data = [
             receipt_data["date"],
@@ -114,11 +162,14 @@ def save_to_google_sheets(receipt_data):
             float(receipt_data["total_incl_gst"])
         ]
         
+        print(f"📝 Row data prepared: {row_data}")
+        
         # Append to the sheet
         body = {
             "values": [row_data]
         }
         
+        print("📤 Sending data to Google Sheets...")
         result = service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
             range="Sheet1!A:E",
@@ -126,10 +177,13 @@ def save_to_google_sheets(receipt_data):
             body=body
         ).execute()
         
+        print(f"✅ Successfully saved to Google Sheets. Result: {result}")
         return True
         
     except Exception as e:
-        print(f"Error saving to Google Sheets: {e}")
+        print(f"❌ Error saving to Google Sheets: {e}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
         return False
 
 def send_telegram_message(chat_id, text, reply_markup=None):
