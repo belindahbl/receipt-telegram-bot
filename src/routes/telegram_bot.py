@@ -184,10 +184,12 @@ def save_to_google_sheets(receipt_data):
         print("📤 Sending data to Google Sheets...")
         result = service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
-            range="Sheet1!A:E",
+            range_ = "Sheet 1!A1:E1",
             valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
             body=body
         ).execute()
+
         
         print(f"✅ Successfully saved to Google Sheets. Result: {result}")
         return True
