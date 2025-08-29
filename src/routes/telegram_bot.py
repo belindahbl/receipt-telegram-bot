@@ -57,11 +57,23 @@ def get_google_sheets_service():
         
         # Fix common private key formatting issues
         if 'private_key' in credentials_dict:
-            # Ensure private key has proper line breaks
             private_key = credentials_dict['private_key']
+            
+            # Ensure private key has proper line breaks
             if '\\n' in private_key:
-                credentials_dict['private_key'] = private_key.replace('\\n', '\n')
+                private_key = private_key.replace('\\n', '\n')
                 print("🔧 Fixed private key line breaks")
+            
+            # Fix missing spaces in BEGIN/END markers
+            if '-----BEGINPRIVATEKEY-----' in private_key:
+                private_key = private_key.replace('-----BEGINPRIVATEKEY-----', '-----BEGIN PRIVATE KEY-----')
+                print("🔧 Fixed BEGIN PRIVATE KEY marker")
+            
+            if '-----ENDPRIVATEKEY-----' in private_key:
+                private_key = private_key.replace('-----ENDPRIVATEKEY-----', '-----END PRIVATE KEY-----')
+                print("🔧 Fixed END PRIVATE KEY marker")
+            
+            credentials_dict['private_key'] = private_key
         
         credentials = service_account.Credentials.from_service_account_info(
             credentials_dict,
