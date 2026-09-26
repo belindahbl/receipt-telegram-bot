@@ -3,7 +3,7 @@ import json
 import base64
 import requests
 from flask import Blueprint, request, jsonify
-import openai
+import anthropic
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from datetime import datetime
@@ -16,12 +16,9 @@ telegram_bp = Blueprint("telegram", __name__)
 
 # Environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
-
-# Initialize OpenAI client
-openai.api_key = OPENAI_API_KEY
 
 # Store receipt data temporarily (in production, use Redis or database)
 temp_receipt_storage = {}
@@ -90,16 +87,33 @@ def get_google_sheets_service():
         return None
 
 def extract_receipt_data(image_base64):
-    """Extract receipt data using OpenAI Vision API."""
+    """Extract receipt data using Claude vision.
+
+    Returns (receipt_data, error_message). On success error_message is None;
+    on failure receipt_data is None and error_message is shown to the user.
+    """
+    if not ANTHROPIC_API_KEY:
+        print("❌ ANTHROPIC_API_KEY environment variable is not set")
+        return None, "❌ The bot's Claude API key is not configured. Please set ANTHROPIC_API_KEY."
+
     try:
-        client = openai.OpenAI()
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         
-        response = client.chat.completions.create(
-            model="gpt-4o",
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
             messages=[
                 {
                     "role": "user",
                     "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_base64
+                            }
+                        },
                         {
                             "type": "text",
                             "text": """Please extract the following information from this receipt image:
@@ -120,32 +134,46 @@ def extract_receipt_data(image_base64):
                             For Singapore receipts, GST is typically 9%. Calculate GST excluded amount as: total_incl_gst / 1.09
                             If GST amount is not shown, calculate it as: total_excl_gst * 0.09
                             """
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }
                         }
                     ]
                 }
-            ],
-            max_tokens=500
+            ]
         )
         
-        content = response.choices[0].message.content
+        content = "".join(block.text for block in response.content if block.type == "text")
+        print(f"Claude response (stop_reason={response.stop_reason}): {content}")
         
         # Extract JSON from the response
         json_match = re.search(r"\{.*\}", content, re.DOTALL)
         if json_match:
             receipt_data = json.loads(json_match.group())
-            return receipt_data
+            return receipt_data, None
         else:
-            return None
-            
+            return None, "❌ Could not read receipt data from this image. Please ensure the image is clear and contains a valid receipt."
+    
+    except anthropic.AuthenticationError as e:
+        print(f"❌ Claude API authentication error: {e}")
+        return None, "❌ The bot's Claude API key is invalid or revoked. Please update ANTHROPIC_API_KEY."
+    except anthropic.PermissionDeniedError as e:
+        print(f"❌ Claude API permission error: {e}")
+        return None, "❌ The bot's Claude API key is not allowed to make this request. Please check the Anthropic Console."
+    except anthropic.RateLimitError as e:
+        print(f"❌ Claude API rate limit error: {e}")
+        return None, "❌ The Claude API is rate limiting the bot. Please try again in a minute."
+    except anthropic.BadRequestError as e:
+        print(f"❌ Claude API bad request: {e}")
+        if "credit balance" in str(e).lower():
+            return None, "❌ The bot's Claude API account is out of credits. Please top up in the Anthropic Console."
+        return None, "❌ The Claude API rejected the request. Please check the server logs."
+    except anthropic.APIStatusError as e:
+        print(f"❌ Claude API error ({e.status_code}): {e}")
+        return None, "❌ The Claude API is having problems right now. Please try again later."
+    except anthropic.APIConnectionError as e:
+        print(f"❌ Could not connect to the Claude API: {e}")
+        return None, "❌ Could not reach the Claude API. Please try again later."
     except Exception as e:
         print(f"Error extracting receipt data: {e}")
-        return None
+        return None, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt."
 
 def save_to_google_sheets(receipt_data):
     """Save receipt data to Google Sheets."""
@@ -280,11 +308,11 @@ def process_receipt_in_background(chat_id, file_id):
             return
         
         # Extract receipt data
-        receipt_data = extract_receipt_data(image_base64)
-        print(f"OpenAI result in background: {receipt_data}")
+        receipt_data, error_message = extract_receipt_data(image_base64)
+        print(f"Claude result in background: {receipt_data}")
         if not receipt_data:
             print("❌ Failed to extract receipt data in background.")
-            send_telegram_message(chat_id, "❌ Failed to extract receipt data. Please ensure the image is clear and contains a valid receipt.")
+            send_telegram_message(chat_id, error_message)
             return
         
         print("📊 Preparing confirmation message...")
