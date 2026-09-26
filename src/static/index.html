@@ -195,15 +195,11 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 ANTHROPIC_API_KEY=your_anthropic_api_key
 GOOGLE_SHEETS_CREDENTIALS_JSON=your_service_account_json
 GOOGLE_SHEETS_ID=your_google_sheets_id
+ALLOWED_CHAT_IDS=your_telegram_chat_id
             </div>
             
-            <p><strong>Step 3:</strong> Set Webhook URL</p>
-            <div class="input-group">
-                <label for="webhookUrl">Webhook URL (your deployed app URL + /telegram/webhook):</label>
-                <input type="text" id="webhookUrl" placeholder="https://your-app.herokuapp.com/telegram/webhook">
-            </div>
-            <button class="button" onclick="setWebhook()">Set Webhook</button>
-            <div id="webhookResult" class="hidden"></div>
+            <p><strong>Step 3:</strong> Deploy</p>
+            <p>The bot registers its Telegram webhook automatically when it starts. Send it any message to get your chat ID, then add it to ALLOWED_CHAT_IDS.</p>
         </div>
         
         <div class="section">
@@ -260,44 +256,6 @@ GOOGLE_SHEETS_ID=your_google_sheets_id
             }
         }
         
-        async function setWebhook() {
-            const webhookUrl = document.getElementById('webhookUrl').value;
-            const resultDiv = document.getElementById('webhookResult');
-            
-            if (!webhookUrl) {
-                resultDiv.className = 'status error';
-                resultDiv.textContent = 'Please enter a webhook URL';
-                resultDiv.classList.remove('hidden');
-                return;
-            }
-            
-            resultDiv.className = 'status info';
-            resultDiv.textContent = 'Setting webhook...';
-            resultDiv.classList.remove('hidden');
-            
-            try {
-                const response = await fetch('/telegram/set_webhook', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ webhook_url: webhookUrl })
-                });
-                
-                const data = await response.json();
-                
-                if (data.ok) {
-                    resultDiv.className = 'status success';
-                    resultDiv.textContent = 'Webhook set successfully!';
-                } else {
-                    resultDiv.className = 'status error';
-                    resultDiv.textContent = 'Failed to set webhook: ' + data.description;
-                }
-            } catch (error) {
-                resultDiv.className = 'status error';
-                resultDiv.textContent = 'Error: ' + error.message;
-            }
-        }
     </script>
 </body>
 </html>
