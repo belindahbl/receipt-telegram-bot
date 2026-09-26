@@ -11,6 +11,7 @@ import re
 import threading
 import html
 import hashlib
+import hmac
 
 telegram_bp = Blueprint("telegram", __name__)
 
@@ -19,6 +20,19 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
+# Comma-separated Telegram chat IDs allowed to use the bot, e.g. "12345678,87654321"
+ALLOWED_CHAT_IDS = {
+    chat_id.strip() for chat_id in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if chat_id.strip()
+}
+# Base URL of this app, e.g. "https://my-bot.onrender.com". Render sets RENDER_EXTERNAL_URL itself.
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
+
+# Secret Telegram sends with every webhook request, derived from the bot token so
+# it needs no extra configuration. Only Telegram (which we give it to) knows it.
+WEBHOOK_SECRET = (
+    hmac.new(TELEGRAM_BOT_TOKEN.encode(), b"telegram-webhook-secret", hashlib.sha256).hexdigest()
+    if TELEGRAM_BOT_TOKEN else None
+)
 
 # Store receipt data temporarily (in production, use Redis or database)
 temp_receipt_storage = {}
@@ -32,7 +46,6 @@ def get_google_sheets_service():
             return None
         
         print(f"📋 Credentials JSON length: {len(GOOGLE_SHEETS_CREDENTIALS_JSON)}")
-        print(f"📋 First 100 chars: {GOOGLE_SHEETS_CREDENTIALS_JSON[:100]}...")
         
         # Try to parse the JSON
         try:
@@ -363,6 +376,11 @@ Please confirm if this data is correct:"""
 def telegram_webhook():
     """Handle incoming Telegram messages."""
     print("=== WEBHOOK RECEIVED ===")
+    received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not WEBHOOK_SECRET or not hmac.compare_digest(received_secret, WEBHOOK_SECRET):
+        print("❌ Rejected webhook request without a valid Telegram secret token")
+        return jsonify({"status": "forbidden"}), 403
+
     try:
         update = request.get_json()
         print(f"Request data keys: {list(update.keys()) if update else 'No data'}")
@@ -371,6 +389,9 @@ def telegram_webhook():
             message = update["message"]
             print(f"Message type: {list(message.keys())}")
             chat_id = message["chat"]["id"]
+            
+            if not is_chat_allowed(chat_id):
+                return jsonify({"status": "ok"})
             
             # Handle photo messages
             if "photo" in message:
@@ -453,6 +474,9 @@ def handle_callback_query(update):
         message_id = callback_query["message"]["message_id"]
         data = callback_query["data"]
         
+        if not is_chat_allowed(chat_id, notify=False):
+            return jsonify({"status": "ok"})
+        
         if data.startswith("confirm:"):
             # Extract receipt hash from callback data
             receipt_hash = data[8:]  # Remove "confirm:" prefix
@@ -500,28 +524,49 @@ def handle_callback_query(update):
         print(f"Error in handle_callback_query: {e}")
         return jsonify({"status": "error", "message": str(e)})
 
-@telegram_bp.route("/callback", methods=["POST"])
-def telegram_callback():
-    """Handle Telegram callback queries (button presses) - legacy endpoint."""
-    return handle_callback_query(request.get_json())
-
-@telegram_bp.route("/set_webhook", methods=["POST"])
-def set_webhook():
-    """Set the webhook URL for the Telegram bot."""
+def register_webhook():
+    """Point Telegram at this app's webhook, with the secret token. Called on startup."""
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN is not set; cannot register webhook")
+        return
     try:
-        data = request.get_json()
-        webhook_url = data.get("webhook_url")
+        if WEBHOOK_BASE_URL:
+            webhook_url = WEBHOOK_BASE_URL.rstrip("/") + "/telegram/webhook"
+        else:
+            # Fall back to whatever URL is already registered, just adding the secret
+            info = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo", timeout=10
+            ).json()
+            webhook_url = info.get("result", {}).get("url")
+            if not webhook_url:
+                print("❌ No webhook URL known. Set WEBHOOK_BASE_URL to this app's URL.")
+                return
         
-        if not webhook_url:
-            return jsonify({"error": "webhook_url is required"}), 400
-        
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-        response = requests.post(url, data={"url": webhook_url}, timeout=10)
-        
-        return jsonify(response.json())
-        
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+            data={"url": webhook_url, "secret_token": WEBHOOK_SECRET},
+            timeout=10,
+        ).json()
+        if response.get("ok"):
+            print(f"✅ Telegram webhook registered: {webhook_url}")
+        else:
+            print(f"❌ Failed to register Telegram webhook: {response}")
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Request errors include the URL, which contains the bot token
+        print(f"❌ Error registering Telegram webhook: {str(e).replace(TELEGRAM_BOT_TOKEN, '<bot-token>')}")
+
+def is_chat_allowed(chat_id, notify=True):
+    """Only chats listed in ALLOWED_CHAT_IDS may use the bot."""
+    if str(chat_id) in ALLOWED_CHAT_IDS:
+        return True
+    print(f"🚫 Ignoring chat {chat_id}: not in ALLOWED_CHAT_IDS")
+    if notify:
+        send_telegram_message(
+            chat_id,
+            f"🔒 This bot is private.\n\nYour chat ID is <code>{chat_id}</code>. "
+            "If this is your bot, add it to ALLOWED_CHAT_IDS in your hosting settings."
+        )
+    return False
 
 @telegram_bp.route("/webhook_info", methods=["GET"])
 def webhook_info():
