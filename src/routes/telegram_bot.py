@@ -6,12 +6,15 @@ from flask import Blueprint, request, jsonify
 import anthropic
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 import re
 import threading
 import html
 import hashlib
 import hmac
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from io import BytesIO
+from PIL import Image, ImageOps
 
 telegram_bp = Blueprint("telegram", __name__)
 
@@ -34,8 +37,18 @@ WEBHOOK_SECRET = (
     if TELEGRAM_BOT_TOKEN else None
 )
 
-# Store receipt data temporarily (in production, use Redis or database)
-temp_receipt_storage = {}
+# Claude model used to read receipts. Sonnet or Opus read small or crowded text better.
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
+GST_RATE = Decimal("0.09")
+SINGAPORE_TZ = timezone(timedelta(hours=8))  # Singapore has no daylight saving
+
+# Claude image limits: formats it accepts, and images larger than this long edge
+# are downscaled by Claude anyway (2576 px on newer models, 1568 px on Haiku 4.5)
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+MAX_IMAGE_LONG_EDGE = 2576
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+EXIF_ORIENTATION = 0x0112
+MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
 def get_google_sheets_service():
     """Initialize Google Sheets service with credentials."""
@@ -99,11 +112,123 @@ def get_google_sheets_service():
         print(f"Full traceback: {traceback.format_exc()}")
         return None
 
-def extract_receipt_data(image_base64):
-    """Extract receipt data using Claude vision.
+RECEIPTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "receipts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    # Separate numbers, so the parts can't come back in the wrong order
+                    "day": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "month": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "year": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "company": {"type": "string"},
+                    "total_incl_gst": {"type": "number"},
+                    "gst_amount": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                },
+                "required": ["day", "month", "year", "company", "total_incl_gst", "gst_amount"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["receipts"],
+    "additionalProperties": False,
+}
 
-    Returns (receipt_data, error_message). On success error_message is None;
-    on failure receipt_data is None and error_message is shown to the user.
+EXTRACTION_PROMPT = """This image may contain one or more receipts. Return one entry per separate receipt, in reading order (top to bottom, left to right). If there are no receipts, return an empty list.
+
+For each receipt:
+- day, month, year: the transaction date as separate numbers, with a four-digit year. These are Singapore receipts: a date printed like 05/07/26 is day/month/year, and one printed like 2026-07-05 is year-month-day. Use null for all three if no date is visible.
+- company: the store or company name as printed.
+- total_incl_gst: the final amount charged, including GST and any service charge (not the cash tendered or change given).
+- gst_amount: the GST amount if it is printed on the receipt; null if no GST amount is printed. Do not calculate it yourself."""
+
+def to_money(value):
+    """Parse a number or string like "$1,234.5" into a Decimal rounded to cents."""
+    cleaned = str(value).replace("$", "").replace(",", "").strip()
+    return Decimal(cleaned).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def build_receipt(date, company, total_incl_gst, gst_amount=None):
+    """Build a receipt dict, calculating GST at 9% when it isn't given."""
+    total = to_money(total_incl_gst)
+    if gst_amount is None:
+        total_excl = to_money(total / (1 + GST_RATE))
+        gst = total - total_excl
+    else:
+        gst = to_money(gst_amount)
+        total_excl = total - gst
+    return {
+        "date": normalize_date(date) or str(date),
+        "company": str(company).strip() or "Unknown",
+        "total_incl_gst": f"{total:.2f}",
+        "gst_amount": f"{gst:.2f}",
+        "total_excl_gst": f"{total_excl:.2f}",
+    }
+
+def receipt_date(day, month, today=None):
+    """Build a DD/MM/YY date from the day and month Claude read.
+
+    The year Claude reads is often wrong, so it isn't used: receipts are
+    dated this year, or last year if that would put them in the future
+    (e.g. a December receipt submitted in January).
+    """
+    if day is None or month is None:
+        return ""
+    if month > 12 and day <= 12:
+        day, month = month, day
+    today = today or datetime.now(SINGAPORE_TZ).date()
+    for year in (today.year, today.year - 1):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            continue
+        if candidate <= today:
+            return candidate.strftime("%d/%m/%y")
+    return ""
+
+def normalize_date(value):
+    """Return a date as DD/MM/YY, or None if it isn't a valid day/month/year date."""
+    match = re.fullmatch(r"\s*(\d{1,2})[/.-](\d{1,2})[/.-](\d{2}|\d{4})\s*", str(value))
+    if not match:
+        return None
+    day, month, year = match.groups()
+    try:
+        parsed = datetime.strptime(f"{day}/{month}/{year}", "%d/%m/%Y" if len(year) == 4 else "%d/%m/%y")
+    except ValueError:
+        return None
+    return parsed.strftime("%d/%m/%y")
+
+def prepare_media(file_bytes, media_type):
+    """Return (content_block, error_message) for sending a downloaded file to Claude."""
+    if media_type == "application/pdf":
+        data = base64.b64encode(file_bytes).decode("utf-8")
+        return {"type": "document", "source": {"type": "base64", "media_type": media_type, "data": data}}, None
+
+    try:
+        image = Image.open(BytesIO(file_bytes))
+        # Phones store rotation in EXIF metadata, which Claude doesn't read
+        needs_rotation = image.getexif().get(EXIF_ORIENTATION, 1) != 1
+        too_large = max(image.size) > MAX_IMAGE_LONG_EDGE or len(file_bytes) > MAX_IMAGE_BYTES
+        if needs_rotation or too_large or media_type not in SUPPORTED_IMAGE_TYPES:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image.thumbnail((MAX_IMAGE_LONG_EDGE, MAX_IMAGE_LONG_EDGE))
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=90)
+            file_bytes, media_type = output.getvalue(), "image/jpeg"
+    except Exception as e:
+        print(f"❌ Could not read image: {e}")
+        return None, "❌ Could not open this image. Please send it as a JPEG or PNG, or as a normal photo."
+
+    data = base64.b64encode(file_bytes).decode("utf-8")
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}, None
+
+def extract_receipts(media_block):
+    """Extract every receipt in an image or PDF using Claude.
+
+    Returns (receipts, error_message). On success error_message is None;
+    on failure receipts is None and error_message is shown to the user.
     """
     if not ANTHROPIC_API_KEY:
         print("❌ ANTHROPIC_API_KEY environment variable is not set")
@@ -113,56 +238,30 @@ def extract_receipt_data(image_base64):
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         
         response = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1024,
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
             messages=[
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_base64
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": """Please extract the following information from this receipt image:
-                            1. Date (convert to DD/MM/YY format)
-                            2. Company/Store name
-                            3. Total amount (including GST)
-                            4. GST amount (if shown, otherwise calculate 9% of pre-GST amount)
-                            
-                            Return the data in this exact JSON format:
-                            {
-                                "date": "DD/MM/YY",
-                                "company": "Company Name",
-                                "total_incl_gst": "X.XX",
-                                "gst_amount": "X.XX",
-                                "total_excl_gst": "X.XX"
-                            }
-                            
-                            For Singapore receipts, GST is typically 9%. Calculate GST excluded amount as: total_incl_gst / 1.09
-                            If GST amount is not shown, calculate it as: total_excl_gst * 0.09
-                            """
-                        }
-                    ]
+                    "content": [media_block, {"type": "text", "text": EXTRACTION_PROMPT}]
                 }
-            ]
+            ],
+            output_config={"format": {"type": "json_schema", "schema": RECEIPTS_SCHEMA}},
         )
         
         content = "".join(block.text for block in response.content if block.type == "text")
         print(f"Claude response (stop_reason={response.stop_reason}): {content}")
         
-        # Extract JSON from the response
-        json_match = re.search(r"\{.*\}", content, re.DOTALL)
-        if json_match:
-            receipt_data = json.loads(json_match.group())
-            return receipt_data, None
-        else:
-            return None, "❌ Could not read receipt data from this image. Please ensure the image is clear and contains a valid receipt."
+        if response.stop_reason != "end_turn":
+            return None, "❌ Could not read receipt data from this image. Please try again."
+        
+        receipts = [
+            build_receipt(receipt_date(r["day"], r["month"]), r["company"], r["total_incl_gst"], r["gst_amount"])
+            for r in json.loads(content)["receipts"]
+        ]
+        if not receipts:
+            return None, "❌ No receipts found in this image. Please ensure the image is clear and contains a receipt."
+        return receipts, None
     
     except anthropic.AuthenticationError as e:
         print(f"❌ Claude API authentication error: {e}")
@@ -281,8 +380,19 @@ def send_telegram_message(chat_id, text, reply_markup=None):
         print(f"Error sending Telegram message: {e}")
         return None
 
-def download_telegram_photo(file_id):
-    """Download photo from Telegram and return as base64."""
+def edit_telegram_message(chat_id, message_id, text, reply_markup=None):
+    """Replace the text (and optionally the buttons) of a message the bot sent."""
+    data = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    response = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", data=data, timeout=10
+    )
+    if response.status_code != 200:
+        print(f"Failed to edit message: {response.text}")
+
+def download_telegram_file(file_id):
+    """Download a file from Telegram and return its bytes."""
     try:
         # Get file path
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
@@ -297,80 +407,164 @@ def download_telegram_photo(file_id):
         
         # Download the file
         download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-        file_response = requests.get(download_url, timeout=30)
+        file_response = requests.get(download_url, timeout=60)
         
         if file_response.status_code == 200:
-            return base64.b64encode(file_response.content).decode("utf-8")
+            return file_response.content
         else:
             return None
             
     except Exception as e:
-        print(f"Error downloading Telegram photo: {e}")
+        # Request errors include the URL, which contains the bot token
+        print(f"Error downloading Telegram file: {str(e).replace(TELEGRAM_BOT_TOKEN, '<bot-token>')}")
         return None
 
-def process_receipt_in_background(chat_id, file_id):
-    """Process receipt in background thread."""
+RECEIPT_BUTTONS = {
+    "inline_keyboard": [
+        [
+            {"text": "✅ Confirm & Save", "callback_data": "confirm"},
+            {"text": "❌ Cancel", "callback_data": "cancel"}
+        ]
+    ]
+}
+
+def format_receipt_message(receipt, index=1, count=1):
+    """The confirmation message for one receipt. parse_receipt_message() reads it back."""
+    title = f"Receipt {index} of {count}" if count > 1 else "Receipt"
+    return f"""📋 <b>{title}</b>
+
+📅 <b>Date:</b> {html.escape(receipt["date"] or "not found")}
+🏪 <b>Company:</b> {html.escape(receipt["company"])}
+💰 <b>Total (incl GST):</b> ${receipt["total_incl_gst"]}
+📊 <b>GST:</b> ${receipt["gst_amount"]}
+💵 <b>Amount (excl GST):</b> ${receipt["total_excl_gst"]}
+
+Tap Confirm to save. To fix a value, reply to this message with e.g. <code>total 12.50</code>, <code>date 05/09/26</code>, <code>company ABC Pte Ltd</code> or <code>gst 0</code>."""
+
+def parse_receipt_message(text):
+    """Read a receipt back from a confirmation message's plain text, or return None.
+
+    Storing the data in the message itself means pending receipts survive
+    server restarts.
+    """
+    if not text or not text.startswith("📋"):
+        return None
+    patterns = {
+        "date": r"^📅 Date: (.*)$",
+        "company": r"^🏪 Company: (.*)$",
+        "total_incl_gst": r"^💰 Total \(incl GST\): \$(.*)$",
+        # Older messages labelled this "GST (9%)"
+        "gst_amount": r"^📊 GST(?: \(9%\))?: \$(.*)$",
+    }
+    values = {}
+    for field, pattern in patterns.items():
+        match = re.search(pattern, text, re.MULTILINE)
+        if not match:
+            return None
+        values[field] = match.group(1).strip()
+    try:
+        return build_receipt(**values)
+    except (InvalidOperation, ValueError):
+        return None
+
+def summarize_receipt(receipt):
+    return f'{html.escape(receipt["date"])} · {html.escape(receipt["company"])} · ${receipt["total_incl_gst"]}'
+
+def process_receipt_in_background(chat_id, file_id, media_type):
+    """Process a receipt photo or file in a background thread."""
     try:
         print("Background processing started...")
         
-        # Download image
-        image_base64 = download_telegram_photo(file_id)
-        if not image_base64:
-            print("❌ Failed to download the image in background.")
+        file_bytes = download_telegram_file(file_id)
+        if not file_bytes:
+            print("❌ Failed to download the file in background.")
             send_telegram_message(chat_id, "❌ Failed to download the image. Please try again.")
             return
         
-        # Extract receipt data
-        receipt_data, error_message = extract_receipt_data(image_base64)
-        print(f"Claude result in background: {receipt_data}")
-        if not receipt_data:
+        media_block, error_message = prepare_media(file_bytes, media_type)
+        if not media_block:
+            send_telegram_message(chat_id, error_message)
+            return
+        
+        receipts, error_message = extract_receipts(media_block)
+        print(f"Claude result in background: {receipts}")
+        if not receipts:
             print("❌ Failed to extract receipt data in background.")
             send_telegram_message(chat_id, error_message)
             return
         
-        print("📊 Preparing confirmation message...")
-        
-        # Store receipt data with a hash key (instead of embedding in callback)
-        receipt_hash = hashlib.md5(json.dumps(receipt_data, sort_keys=True).encode()).hexdigest()[:8]
-        temp_receipt_storage[receipt_hash] = receipt_data
-        
-        # Clean up the text - escape HTML entities and fix formatting
-        company_name = html.escape(str(receipt_data.get("company", "Unknown")))
-        date_str = html.escape(str(receipt_data.get("date", "Unknown")))
-        total_incl = html.escape(str(receipt_data.get("total_incl_gst", "0.00")))
-        gst_amount = html.escape(str(receipt_data.get("gst_amount", "0.00")))
-        total_excl = html.escape(str(receipt_data.get("total_excl_gst", "0.00")))
-        
-        confirmation_text = f"""📋 <b>Receipt Data Extracted:</b>
-
-📅 <b>Date:</b> {date_str}
-🏪 <b>Company:</b> {company_name}
-💰 <b>Total (incl GST):</b> ${total_incl}
-📊 <b>GST (9%):</b> ${gst_amount}
-💵 <b>Amount (excl GST):</b> ${total_excl}
-
-Please confirm if this data is correct:"""
-        
-        reply_markup = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Confirm & Save", "callback_data": f"confirm:{receipt_hash}"},
-                    {"text": "❌ Cancel", "callback_data": "cancel"}
-                ]
-            ]
-        }
-        
-        result = send_telegram_message(chat_id, confirmation_text, reply_markup)
-        if result:
-            print("✅ PROCESS COMPLETE in background - User notified successfully")
-        else:
-            print("❌ Failed to send confirmation message")
+        if len(receipts) > 1:
+            send_telegram_message(chat_id, f"🧾 Found {len(receipts)} receipts. Please check each one:")
+        for index, receipt in enumerate(receipts, start=1):
+            send_telegram_message(chat_id, format_receipt_message(receipt, index, len(receipts)), RECEIPT_BUTTONS)
+        print("✅ PROCESS COMPLETE in background - User notified successfully")
             
     except Exception as e:
         print(f"❌ ERROR in background processing: {str(e)}")
         import traceback
         print(f"Full traceback: {traceback.format_exc()}")
         send_telegram_message(chat_id, "❌ An error occurred while processing your receipt. Please try again.")
+
+def start_receipt_processing(chat_id, file_id, media_type):
+    """Acknowledge the upload and process it in the background."""
+    print("Sending \"processing\" message to user...")
+    if not send_telegram_message(chat_id, "📄 Processing your receipt... Please wait."):
+        print("❌ Failed to send processing message")
+        return jsonify({"status": "error"})
+    
+    # Start background processing
+    thread = threading.Thread(target=process_receipt_in_background, args=(chat_id, file_id, media_type))
+    thread.daemon = True
+    thread.start()
+    
+    print("Webhook returning OK, background processing initiated.")
+    return jsonify({"status": "ok"})
+
+CORRECTION_HELP = (
+    "✏️ To fix a value, reply to the receipt with one of:\n"
+    "<code>total 12.50</code>\n<code>gst 1.03</code> (or <code>gst 0</code> if no GST was charged)\n"
+    "<code>date 05/09/26</code>\n<code>company ABC Pte Ltd</code>"
+)
+
+def apply_correction(chat_id, message):
+    """Update a pending receipt from a reply like "total 12.50"."""
+    original = message["reply_to_message"]
+    receipt = parse_receipt_message(original.get("text", ""))
+    if not receipt:
+        send_telegram_message(chat_id, "❌ That message isn't a pending receipt. Reply to a receipt that still has Confirm and Cancel buttons.")
+        return
+    
+    match = re.fullmatch(r"\s*(date|company|total|gst)\s*[:=]?\s*(.+?)\s*", message["text"], re.IGNORECASE | re.DOTALL)
+    if not match:
+        send_telegram_message(chat_id, CORRECTION_HELP)
+        return
+    field, value = match.group(1).lower(), match.group(2)
+    
+    try:
+        if field == "date":
+            date = normalize_date(value)
+            if not date:
+                send_telegram_message(chat_id, "❌ Please give the date as DD/MM/YY, e.g. <code>date 05/09/26</code>.")
+                return
+            receipt["date"] = date
+        elif field == "company":
+            receipt["company"] = value[:100]
+        elif field == "total":
+            # A new total means the old GST no longer applies; recalculate at 9%
+            receipt = build_receipt(receipt["date"], receipt["company"], value)
+        elif field == "gst":
+            if to_money(value) > to_money(receipt["total_incl_gst"]):
+                send_telegram_message(chat_id, "❌ GST can't be more than the total.")
+                return
+            receipt = build_receipt(receipt["date"], receipt["company"], receipt["total_incl_gst"], value)
+    except (InvalidOperation, ValueError):
+        send_telegram_message(chat_id, f"❌ <code>{html.escape(value)}</code> isn't a valid amount.")
+        return
+    
+    title_match = re.match(r"📋 Receipt (\d+) of (\d+)", original["text"])
+    index, count = (int(title_match.group(1)), int(title_match.group(2))) if title_match else (1, 1)
+    edit_telegram_message(chat_id, original["message_id"], format_receipt_message(receipt, index, count), RECEIPT_BUTTONS)
+    send_telegram_message(chat_id, f"✏️ Updated {field}. Check the receipt above and tap Confirm to save.")
 
 @telegram_bp.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -393,36 +587,37 @@ def telegram_webhook():
             if not is_chat_allowed(chat_id):
                 return jsonify({"status": "ok"})
             
-            # Handle photo messages
+            # Handle photo messages (Telegram sends these as compressed JPEGs)
             if "photo" in message:
                 print("📸 PHOTO DETECTED - Starting processing...")
                 photo = max(message["photo"], key=lambda x: x["file_size"])
-                file_id = photo["file_id"]
-                
-                print("Sending \"processing\" message to user...")
-                result = send_telegram_message(chat_id, "📄 Processing your receipt... Please wait.")
-                
-                if not result:
-                    print("❌ Failed to send processing message")
-                    return jsonify({"status": "error"})
-                
-                # Start background processing
-                thread = threading.Thread(target=process_receipt_in_background, args=(chat_id, file_id))
-                thread.daemon = True
-                thread.start()
-                
-                print("Webhook returning OK, background processing initiated.")
-                return jsonify({"status": "ok"})
+                return start_receipt_processing(chat_id, photo["file_id"], "image/jpeg")
+            
+            # Handle images and PDFs sent as files
+            elif "document" in message:
+                document = message["document"]
+                media_type = document.get("mime_type", "")
+                print(f"📎 DOCUMENT DETECTED ({media_type})")
+                if not (media_type.startswith("image/") or media_type == "application/pdf"):
+                    send_telegram_message(chat_id, "❌ Please send a photo, an image file or a PDF.")
+                elif document.get("file_size", 0) > MAX_TELEGRAM_DOWNLOAD_BYTES:
+                    send_telegram_message(chat_id, "❌ That file is over 20 MB, which is too large for Telegram bots. Please send a smaller file.")
+                else:
+                    return start_receipt_processing(chat_id, document["file_id"], media_type)
                 
             # Handle text messages
             elif "text" in message:
                 text = message["text"].lower()
                 print(f"Text message received: {text}")
                 
-                if text == "/start":
+                reply_to = message.get("reply_to_message")
+                if reply_to and reply_to.get("from", {}).get("is_bot"):
+                    apply_correction(chat_id, message)
+                
+                elif text == "/start":
                     welcome_text = """🤖 <b>Welcome to Receipt Scanner Bot!</b>
 
-📸 Send me a photo of your receipt and I'll:
+📸 Send me a photo of your receipt (or several receipts in one photo) and I'll:
 1. Extract the key information (date, company, amounts)
 2. Show you the extracted data for confirmation
 3. Save it to your Google Sheets automatically
@@ -431,19 +626,22 @@ Just send a photo to get started! 📄"""
                     send_telegram_message(chat_id, welcome_text)
                 
                 elif text == "/help":
-                    help_text = """📋 <b>How to use Receipt Scanner Bot:</b>
+                    help_text = f"""📋 <b>How to use Receipt Scanner Bot:</b>
 
-1. 📸 Take a clear photo of your receipt
-2. 📤 Send the photo to this bot
+1. 📸 Take a clear photo of one or more receipts
+2. 📤 Send the photo to this bot (images sent as files and PDFs work too)
 3. ⏳ Wait for data extraction (usually takes a few seconds)
-4. ✅ Review and confirm the extracted data
+4. ✅ Review each receipt and tap Confirm
 5. 💾 Data will be saved to your Google Sheets
+
+{CORRECTION_HELP}
 
 <b>Tips for best results:</b>
 • Ensure good lighting
 • Keep the receipt flat
 • Make sure all text is visible and readable
 • Avoid shadows and glare
+• For more than 2-3 receipts, send separate photos, or send the photo as a file for full resolution
 
 <b>Commands:</b>
 /start - Welcome message
@@ -466,6 +664,10 @@ Just send a photo to get started! 📄"""
         print(f"Full traceback: {traceback.format_exc()}")
         return jsonify({"status": "error", "message": str(e)})
 
+# Receipts currently being saved, so a double tap on Confirm doesn't save twice
+saving_message_ids = set()
+saving_lock = threading.Lock()
+
 def handle_callback_query(update):
     """Handle Telegram callback queries (button presses)."""
     try:
@@ -477,46 +679,35 @@ def handle_callback_query(update):
         if not is_chat_allowed(chat_id, notify=False):
             return jsonify({"status": "ok"})
         
-        if data.startswith("confirm:"):
-            # Extract receipt hash from callback data
-            receipt_hash = data[8:]  # Remove "confirm:" prefix
-            receipt_data = temp_receipt_storage.get(receipt_hash)
-            
-            if not receipt_data:
-                response_text = "❌ <b>Error:</b> Receipt data expired. Please try again."
-            else:
-                # Save to Google Sheets
-                success = save_to_google_sheets(receipt_data)
-                
-                if success:
-                    response_text = "✅ <b>Receipt saved successfully!</b>\n\nYour data has been added to the Google Sheets."
-                    # Clean up temporary storage
-                    temp_receipt_storage.pop(receipt_hash, None)
+        # Answer the callback query (stops the button's loading spinner)
+        answer_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        requests.post(answer_url, data={"callback_query_id": callback_query["id"]}, timeout=10)
+        
+        receipt = parse_receipt_message(callback_query["message"].get("text", ""))
+        if not receipt:
+            edit_telegram_message(chat_id, message_id, "❌ Could not read this receipt's details. Please send the photo again.")
+            return jsonify({"status": "ok"})
+        
+        # "confirm:<id>" is the format used before receipts were stored in the message
+        if data == "confirm" or data.startswith("confirm:"):
+            if not normalize_date(receipt["date"]):
+                send_telegram_message(chat_id, "📅 This receipt has no valid date. Reply to it with e.g. <code>date 05/09/26</code>, then tap Confirm.")
+                return jsonify({"status": "ok"})
+            with saving_lock:
+                if message_id in saving_message_ids:
+                    return jsonify({"status": "ok"})
+                saving_message_ids.add(message_id)
+            try:
+                if save_to_google_sheets(receipt):
+                    edit_telegram_message(chat_id, message_id, f"✅ <b>Saved:</b> {summarize_receipt(receipt)}")
                 else:
-                    response_text = "❌ <b>Failed to save receipt.</b>\n\nPlease check your Google Sheets configuration and try again."
+                    send_telegram_message(chat_id, "❌ <b>Failed to save receipt.</b>\n\nPlease check your Google Sheets configuration and tap Confirm again.")
+            finally:
+                with saving_lock:
+                    saving_message_ids.discard(message_id)
             
         elif data == "cancel":
-            response_text = "❌ <b>Receipt processing cancelled.</b>\n\nSend another photo to try again."
-        else:
-            response_text = "❌ Unknown action."
-        
-        # Edit the original message to remove buttons
-        edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-        edit_data = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": response_text,
-            "parse_mode": "HTML"
-        }
-        edit_response = requests.post(edit_url, data=edit_data, timeout=10)
-        
-        if edit_response.status_code != 200:
-            print(f"Failed to edit message: {edit_response.text}")
-        
-        # Answer the callback query
-        answer_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
-        answer_data = {"callback_query_id": callback_query["id"]}
-        requests.post(answer_url, data=answer_data, timeout=10)
+            edit_telegram_message(chat_id, message_id, f"❌ <b>Cancelled:</b> {summarize_receipt(receipt)}")
         
         return jsonify({"status": "ok"})
         
