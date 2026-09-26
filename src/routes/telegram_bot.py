@@ -6,7 +6,7 @@ from flask import Blueprint, request, jsonify
 import anthropic
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 import re
 import threading
 import html
@@ -40,6 +40,7 @@ WEBHOOK_SECRET = (
 # Claude model used to read receipts. Sonnet or Opus read small or crowded text better.
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
 GST_RATE = Decimal("0.09")
+SINGAPORE_TZ = timezone(timedelta(hours=8))  # Singapore has no daylight saving
 
 # Claude image limits: formats it accepts, and images larger than this long edge
 # are downscaled by Claude anyway (2576 px on newer models, 1568 px on Haiku 4.5)
@@ -119,12 +120,15 @@ RECEIPTS_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "date": {"type": "string"},
+                    # Separate numbers, so the parts can't come back in the wrong order
+                    "day": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "month": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "year": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
                     "company": {"type": "string"},
                     "total_incl_gst": {"type": "number"},
                     "gst_amount": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                 },
-                "required": ["date", "company", "total_incl_gst", "gst_amount"],
+                "required": ["day", "month", "year", "company", "total_incl_gst", "gst_amount"],
                 "additionalProperties": False,
             },
         }
@@ -136,7 +140,7 @@ RECEIPTS_SCHEMA = {
 EXTRACTION_PROMPT = """This image may contain one or more receipts. Return one entry per separate receipt, in reading order (top to bottom, left to right). If there are no receipts, return an empty list.
 
 For each receipt:
-- date: the transaction date as DD/MM/YY. These are Singapore receipts, so read ambiguous dates as day/month. Use an empty string if no date is visible.
+- day, month, year: the transaction date as separate numbers, with a four-digit year. These are Singapore receipts: a date printed like 05/07/26 is day/month/year, and one printed like 2026-07-05 is year-month-day. Use null for all three if no date is visible.
 - company: the store or company name as printed.
 - total_incl_gst: the final amount charged, including GST and any service charge (not the cash tendered or change given).
 - gst_amount: the GST amount if it is printed on the receipt; null if no GST amount is printed. Do not calculate it yourself."""
@@ -162,6 +166,27 @@ def build_receipt(date, company, total_incl_gst, gst_amount=None):
         "gst_amount": f"{gst:.2f}",
         "total_excl_gst": f"{total_excl:.2f}",
     }
+
+def receipt_date(day, month, today=None):
+    """Build a DD/MM/YY date from the day and month Claude read.
+
+    The year Claude reads is often wrong, so it isn't used: receipts are
+    dated this year, or last year if that would put them in the future
+    (e.g. a December receipt submitted in January).
+    """
+    if day is None or month is None:
+        return ""
+    if month > 12 and day <= 12:
+        day, month = month, day
+    today = today or datetime.now(SINGAPORE_TZ).date()
+    for year in (today.year, today.year - 1):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            continue
+        if candidate <= today:
+            return candidate.strftime("%d/%m/%y")
+    return ""
 
 def normalize_date(value):
     """Return a date as DD/MM/YY, or None if it isn't a valid day/month/year date."""
@@ -231,7 +256,7 @@ def extract_receipts(media_block):
             return None, "❌ Could not read receipt data from this image. Please try again."
         
         receipts = [
-            build_receipt(r["date"], r["company"], r["total_incl_gst"], r["gst_amount"])
+            build_receipt(receipt_date(r["day"], r["month"]), r["company"], r["total_incl_gst"], r["gst_amount"])
             for r in json.loads(content)["receipts"]
         ]
         if not receipts:
@@ -408,7 +433,7 @@ def format_receipt_message(receipt, index=1, count=1):
     title = f"Receipt {index} of {count}" if count > 1 else "Receipt"
     return f"""📋 <b>{title}</b>
 
-📅 <b>Date:</b> {html.escape(receipt["date"])}
+📅 <b>Date:</b> {html.escape(receipt["date"] or "not found")}
 🏪 <b>Company:</b> {html.escape(receipt["company"])}
 💰 <b>Total (incl GST):</b> ${receipt["total_incl_gst"]}
 📊 <b>GST:</b> ${receipt["gst_amount"]}
@@ -665,6 +690,9 @@ def handle_callback_query(update):
         
         # "confirm:<id>" is the format used before receipts were stored in the message
         if data == "confirm" or data.startswith("confirm:"):
+            if not normalize_date(receipt["date"]):
+                send_telegram_message(chat_id, "📅 This receipt has no valid date. Reply to it with e.g. <code>date 05/09/26</code>, then tap Confirm.")
+                return jsonify({"status": "ok"})
             with saving_lock:
                 if message_id in saving_message_ids:
                     return jsonify({"status": "ok"})
